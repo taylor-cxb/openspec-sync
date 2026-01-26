@@ -1,0 +1,462 @@
+#!/usr/bin/env node
+
+import { program } from 'commander';
+import select from '@inquirer/select';
+import confirm from '@inquirer/confirm';
+import input from '@inquirer/input';
+import chalk from 'chalk';
+import * as fs from 'fs';
+import * as path from 'path';
+
+import {
+  getJiraConfig,
+  setJiraConfig,
+  clearJiraConfig,
+  getConfigPath,
+} from './config';
+import {
+  extractTicketId,
+  getTicketFromBranch,
+  isGitRepo,
+  getRepoRoot,
+} from './git';
+import { JiraClient } from './jira';
+import { zipDirectory, unzipToDirectory, getTempZipPath, cleanupTempFile } from './zip';
+
+const OPENSPEC_DIR = 'openspec/changes';
+
+/**
+ * Find the openspec/changes directory from current location
+ */
+async function findOpenspecDir(): Promise<string | null> {
+  try {
+    const repoRoot = await getRepoRoot();
+    const openspecPath = path.join(repoRoot, OPENSPEC_DIR);
+
+    if (fs.existsSync(openspecPath)) {
+      return openspecPath;
+    }
+  } catch {
+    // Not in a git repo, try current directory
+  }
+
+  // Try current directory
+  const localPath = path.join(process.cwd(), OPENSPEC_DIR);
+  if (fs.existsSync(localPath)) {
+    return localPath;
+  }
+
+  return null;
+}
+
+/**
+ * Get all change folders in openspec/changes
+ */
+function getChangeFolders(openspecDir: string): string[] {
+  return fs
+    .readdirSync(openspecDir)
+    .filter((name) => {
+      const fullPath = path.join(openspecDir, name);
+      return fs.statSync(fullPath).isDirectory() && name !== 'archive';
+    });
+}
+
+/**
+ * Find folders matching a ticket ID (prefixed with ticket)
+ */
+function findTicketFolders(openspecDir: string, ticketId: string): string[] {
+  return getChangeFolders(openspecDir).filter((name) =>
+    name.toUpperCase().startsWith(ticketId.toUpperCase())
+  );
+}
+
+/**
+ * Find folders that don't have any ticket prefix
+ */
+function findUnprefixedFolders(openspecDir: string): string[] {
+  return getChangeFolders(openspecDir).filter(
+    (name) => !extractTicketId(name)
+  );
+}
+
+/**
+ * Resolve ticket ID from argument or branch
+ */
+async function resolveTicketId(ticketArg?: string): Promise<string | null> {
+  if (ticketArg) {
+    const extracted = extractTicketId(ticketArg);
+    if (extracted) return extracted;
+    // If it looks like a ticket ID already, use it
+    if (/^[A-Z]+-\d+$/i.test(ticketArg)) {
+      return ticketArg.toUpperCase();
+    }
+  }
+
+  // Try to get from branch
+  return getTicketFromBranch();
+}
+
+// CLI Configuration
+program
+  .name('openspec-sync')
+  .description('Sync OpenSpec files to and from JIRA tickets')
+  .version('1.0.0');
+
+// Config command
+program
+  .command('config')
+  .description('Configure JIRA credentials')
+  .option('--clear', 'Clear stored credentials')
+  .option('--show', 'Show config file location')
+  .action(async (options) => {
+    if (options.show) {
+      console.log(chalk.gray('Config file:'), getConfigPath());
+      const config = getJiraConfig();
+      if (config) {
+        console.log(chalk.gray('JIRA host:'), config.host);
+        console.log(chalk.gray('Email:'), config.email);
+        console.log(chalk.gray('API token:'), '***configured***');
+      } else {
+        console.log(chalk.yellow('No JIRA credentials configured'));
+      }
+      return;
+    }
+
+    if (options.clear) {
+      clearJiraConfig();
+      console.log(chalk.green('JIRA credentials cleared'));
+      return;
+    }
+
+    // Interactive configuration
+    console.log(chalk.blue.bold('\nConfigure JIRA Connection\n'));
+    console.log(
+      chalk.gray('Get your API token from: https://id.atlassian.com/manage-profile/security/api-tokens\n')
+    );
+
+    const host = await input({
+      message: 'JIRA host (e.g., yourcompany.atlassian.net):',
+      validate: (v) => v.trim().length > 0 || 'Host is required',
+    });
+
+    const email = await input({
+      message: 'Email:',
+      validate: (v) => v.includes('@') || 'Enter a valid email',
+    });
+
+    const apiToken = await input({
+      message: 'API token:',
+      validate: (v) => v.trim().length > 0 || 'Token is required',
+    });
+
+    setJiraConfig({
+      host: host.trim(),
+      email: email.trim(),
+      apiToken: apiToken.trim(),
+    });
+
+    console.log(chalk.green('\nJIRA credentials saved!'));
+
+    // Test connection
+    console.log(chalk.blue('Testing connection...'));
+    try {
+      const client = new JiraClient(getJiraConfig()!);
+      await client.getIssue('NFOR-1'); // Try to access any issue
+      console.log(chalk.green('Connection successful!'));
+    } catch (error) {
+      console.log(
+        chalk.yellow('Could not verify connection (this may be normal if NFOR-1 does not exist)')
+      );
+    }
+  });
+
+// Push command
+program
+  .command('push [ticket]')
+  .description('Push OpenSpec changes to JIRA ticket')
+  .option('--dry-run', 'Test folder detection and rename without uploading to JIRA')
+  .action(async (ticketArg: string | undefined, options: { dryRun?: boolean }) => {
+    // Check JIRA config (skip for dry-run)
+    const jiraConfig = getJiraConfig();
+    if (!jiraConfig && !options.dryRun) {
+      console.error(chalk.red('JIRA not configured. Run: openspec-sync config'));
+      process.exit(1);
+    }
+
+    // Find openspec directory
+    const openspecDir = await findOpenspecDir();
+    if (!openspecDir) {
+      console.error(chalk.red('No openspec/changes directory found'));
+      process.exit(1);
+    }
+
+    // Resolve ticket ID
+    let ticketId = await resolveTicketId(ticketArg);
+
+    if (!ticketId) {
+      ticketId = await input({
+        message: 'Enter ticket ID (e.g., NFOR-225):',
+        validate: (v) => /^[A-Z]+-\d+$/i.test(v.trim()) || 'Enter a valid ticket ID',
+      });
+      ticketId = ticketId.toUpperCase();
+    }
+
+    console.log(chalk.blue(`\nTicket: ${ticketId}`));
+
+    // Find matching folders
+    let ticketFolders = findTicketFolders(openspecDir, ticketId);
+
+    if (ticketFolders.length === 0) {
+      // No matching folder - offer to prepend ticket to existing folder
+      const unprefixed = findUnprefixedFolders(openspecDir);
+
+      if (unprefixed.length === 0) {
+        console.error(
+          chalk.red(`No folders found for ${ticketId} and no unprefixed folders to associate`)
+        );
+        process.exit(1);
+      }
+
+      console.log(
+        chalk.yellow(`\nNo folder found for ${ticketId}. Found unprefixed folders:\n`)
+      );
+
+      const selectedFolder = await select({
+        message: `Which folder should be associated with ${ticketId}?`,
+        choices: [
+          ...unprefixed.map((name) => ({ value: name, name })),
+          { value: '__cancel__', name: chalk.gray('Cancel') },
+        ],
+      });
+
+      if (selectedFolder === '__cancel__') {
+        console.log(chalk.gray('Cancelled'));
+        process.exit(0);
+      }
+
+      // Rename folder to include ticket prefix
+      const oldPath = path.join(openspecDir, selectedFolder);
+      const newName = `${ticketId}-${selectedFolder}`;
+      const newPath = path.join(openspecDir, newName);
+
+      const shouldRename = await confirm({
+        message: `Rename "${selectedFolder}" to "${newName}"?`,
+        default: true,
+      });
+
+      if (!shouldRename) {
+        console.log(chalk.gray('Cancelled'));
+        process.exit(0);
+      }
+
+      fs.renameSync(oldPath, newPath);
+      console.log(chalk.green(`Renamed: ${selectedFolder} -> ${newName}`));
+      ticketFolders = [newName];
+    }
+
+    // If multiple folders match, let user pick
+    let targetFolder: string;
+    if (ticketFolders.length === 1) {
+      targetFolder = ticketFolders[0];
+    } else {
+      targetFolder = await select({
+        message: 'Multiple folders found. Which one to push?',
+        choices: ticketFolders.map((name) => ({ value: name, name })),
+      });
+    }
+
+    const folderPath = path.join(openspecDir, targetFolder);
+    console.log(chalk.gray(`Folder: ${targetFolder}`));
+
+    // Dry-run stops here
+    if (options.dryRun) {
+      console.log(chalk.green.bold(`\n[Dry-run] Would push ${targetFolder} to ${ticketId}`));
+      console.log(chalk.gray('No changes made to JIRA. Folder rename (if any) was applied.'));
+      return;
+    }
+
+    // Verify ticket exists in JIRA
+    console.log(chalk.blue('\nVerifying ticket...'));
+    const jira = new JiraClient(jiraConfig!);
+
+    try {
+      const issue = await jira.getIssue(ticketId);
+      console.log(chalk.gray(`Found: ${issue.fields.summary}`));
+    } catch (error) {
+      console.error(chalk.red(`Ticket ${ticketId} not found or not accessible`));
+      process.exit(1);
+    }
+
+    // Check for existing attachment
+    const existing = await jira.findOpenspecAttachment(ticketId);
+    if (existing) {
+      const overwrite = await confirm({
+        message: chalk.yellow(`openspec.zip already exists on ${ticketId}. Replace it?`),
+        default: true,
+      });
+
+      if (!overwrite) {
+        console.log(chalk.gray('Cancelled'));
+        process.exit(0);
+      }
+    }
+
+    // Create zip
+    console.log(chalk.blue('Creating zip...'));
+    const tempZip = getTempZipPath();
+
+    try {
+      await zipDirectory(folderPath, tempZip);
+      const stats = fs.statSync(tempZip);
+      console.log(chalk.gray(`Zip size: ${(stats.size / 1024).toFixed(1)} KB`));
+
+      // Upload to JIRA
+      console.log(chalk.blue('Uploading to JIRA...'));
+      await jira.uploadAttachment(ticketId, tempZip, 'openspec.zip');
+
+      console.log(chalk.green.bold(`\nPushed ${targetFolder} to ${ticketId}`));
+    } finally {
+      cleanupTempFile(tempZip);
+    }
+  });
+
+// Pull command
+program
+  .command('pull [ticket]')
+  .description('Pull OpenSpec changes from JIRA ticket')
+  .option('--force', 'Overwrite existing folder without prompting')
+  .action(async (ticketArg: string | undefined, options: { force?: boolean }) => {
+    // Check JIRA config
+    const jiraConfig = getJiraConfig();
+    if (!jiraConfig) {
+      console.error(chalk.red('JIRA not configured. Run: openspec-sync config'));
+      process.exit(1);
+    }
+
+    // Find openspec directory
+    const openspecDir = await findOpenspecDir();
+    if (!openspecDir) {
+      console.error(chalk.red('No openspec/changes directory found'));
+      process.exit(1);
+    }
+
+    // Resolve ticket ID
+    let ticketId = await resolveTicketId(ticketArg);
+
+    if (!ticketId) {
+      ticketId = await input({
+        message: 'Enter ticket ID (e.g., NFOR-225):',
+        validate: (v) => /^[A-Z]+-\d+$/i.test(v.trim()) || 'Enter a valid ticket ID',
+      });
+      ticketId = ticketId.toUpperCase();
+    }
+
+    console.log(chalk.blue(`\nTicket: ${ticketId}`));
+
+    // Check JIRA for attachment
+    console.log(chalk.blue('Checking JIRA...'));
+    const jira = new JiraClient(jiraConfig);
+
+    const attachment = await jira.findOpenspecAttachment(ticketId);
+    if (!attachment) {
+      console.error(chalk.red(`No openspec.zip found on ${ticketId}`));
+      process.exit(1);
+    }
+
+    console.log(
+      chalk.gray(
+        `Found openspec.zip (${(attachment.size / 1024).toFixed(1)} KB, uploaded ${attachment.created})`
+      )
+    );
+
+    // Check for existing local folders
+    const existingFolders = findTicketFolders(openspecDir, ticketId);
+
+    if (existingFolders.length > 0) {
+      if (!options.force) {
+        console.log(chalk.yellow(`\nExisting folder(s) found: ${existingFolders.join(', ')}`));
+        console.log(chalk.gray('These will be overwritten if the zip contains matching folder names.\n'));
+
+        const shouldContinue = await confirm({
+          message: 'Continue with pull?',
+          default: true,
+        });
+
+        if (!shouldContinue) {
+          console.log(chalk.gray('Cancelled'));
+          process.exit(0);
+        }
+      }
+    }
+
+    // Download and extract directly to openspec/changes/
+    // The zip contains the folder structure (e.g., NFOR-225-add-field-metrics/)
+    console.log(chalk.blue('Downloading...'));
+    const tempZip = getTempZipPath();
+
+    try {
+      await jira.downloadAttachment(attachment, tempZip);
+
+      console.log(chalk.blue('Extracting...'));
+      await unzipToDirectory(tempZip, openspecDir);
+
+      console.log(chalk.green.bold(`\nPulled ${ticketId} specs to ${openspecDir}`));
+    } finally {
+      cleanupTempFile(tempZip);
+    }
+  });
+
+// Status command
+program
+  .command('status [ticket]')
+  .description('Check if specs exist on JIRA ticket')
+  .action(async (ticketArg?: string) => {
+    // Check JIRA config
+    const jiraConfig = getJiraConfig();
+    if (!jiraConfig) {
+      console.error(chalk.red('JIRA not configured. Run: openspec-sync config'));
+      process.exit(1);
+    }
+
+    // Resolve ticket ID
+    let ticketId = await resolveTicketId(ticketArg);
+
+    if (!ticketId) {
+      ticketId = await input({
+        message: 'Enter ticket ID (e.g., NFOR-225):',
+        validate: (v) => /^[A-Z]+-\d+$/i.test(v.trim()) || 'Enter a valid ticket ID',
+      });
+      ticketId = ticketId.toUpperCase();
+    }
+
+    const jira = new JiraClient(jiraConfig);
+
+    try {
+      const issue = await jira.getIssue(ticketId);
+      console.log(chalk.blue(`\n${ticketId}: ${issue.fields.summary}`));
+
+      const attachment = await jira.findOpenspecAttachment(ticketId);
+
+      if (attachment) {
+        console.log(chalk.green('openspec.zip: attached'));
+        console.log(chalk.gray(`  Size: ${(attachment.size / 1024).toFixed(1)} KB`));
+        console.log(chalk.gray(`  Uploaded: ${attachment.created}`));
+      } else {
+        console.log(chalk.yellow('openspec.zip: not found'));
+      }
+
+      // Check local
+      const openspecDir = await findOpenspecDir();
+      if (openspecDir) {
+        const localFolders = findTicketFolders(openspecDir, ticketId);
+        if (localFolders.length > 0) {
+          console.log(chalk.gray(`\nLocal folders: ${localFolders.join(', ')}`));
+        }
+      }
+    } catch (error) {
+      console.error(chalk.red(`Ticket ${ticketId} not found or not accessible`));
+      process.exit(1);
+    }
+  });
+
+program.parse(process.argv);

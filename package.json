@@ -1,0 +1,37 @@
+{
+  "name": "openspec-sync",
+  "version": "1.0.0",
+  "description": "Sync OpenSpec files to and from JIRA tickets",
+  "main": "dist/index.js",
+  "bin": {
+    "openspec-sync": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "openspec",
+    "jira",
+    "sync",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@inquirer/prompts": "^8.0.2",
+    "archiver": "^7.0.1",
+    "chalk": "^4.1.2",
+    "commander": "^14.0.2",
+    "extract-zip": "^2.0.1",
+    "simple-git": "^3.30.0"
+  },
+  "devDependencies": {
+    "@types/archiver": "^6.0.3",
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}
