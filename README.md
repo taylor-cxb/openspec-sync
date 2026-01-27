@@ -165,7 +165,7 @@ openspec/changes/
     └── ...
 ```
 
-If you create a folder without a ticket prefix (e.g., `add-field-metrics/`), the `push` command will offer to rename it with the ticket prefix.
+If openspec creates a folder without a ticket prefix (e.g., `add-field-metrics/`), the `push` command will offer to rename it with the ticket prefix.
 
 ## How It Works
 
@@ -288,6 +288,46 @@ The sync tracking is informational, not blocking:
 - If JIRA is down, you still have your local specs
 - If git history is weird, just push again to update the commit hash
 - SYNC.md can be manually deleted if needed - push will recreate it
+
+## Integration with OpenSpec project.md
+
+If you're using [openspec](https://github.com/anthropics/openspec) for AI-assisted spec writing, you can document the openspec-sync workflow in your project's `openspec/project.md` file. This helps AI assistants understand how to persist spec work.
+
+Add a section like this to your `project.md`:
+
+```markdown
+### OpenSpec Sync Workflow
+This project uses `openspec-sync` to persist spec work to JIRA tickets. This enables context switching between efforts without losing spec progress.
+
+**Setup** (one-time):
+```bash
+cd ~/Utils/openspec-sync
+npm install && npm run build && npm link
+openspec-sync config  # Configure JIRA credentials
+```
+
+**Daily workflow**:
+```bash
+# Push current spec work to JIRA (auto-detects ticket from branch)
+openspec-sync push
+
+# Pull spec work when returning to a ticket
+openspec-sync pull
+
+# Check if specs exist on a ticket
+openspec-sync status NFOR-XXX
+```
+
+**How it works**:
+- Zips `openspec/changes/{TICKET-ID}-*/` folder and uploads as `openspec.zip` attachment
+- Pulls download and extract to `openspec/changes/`
+- Auto-detects ticket ID from branch name (e.g., `feat/NFOR-307-*` → `NFOR-307`)
+- Prompts to rename unprefixed folders with ticket prefix before pushing
+
+**Important**: The `openspec/` directory is gitignored - specs are stored in JIRA, not git.
+```
+
+This gives AI assistants (like Claude) context about how to save and restore spec work when you switch between tickets.
 
 ## License
 
