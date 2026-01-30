@@ -425,11 +425,19 @@ program
       process.exit(1);
     }
 
-    // Find openspec directory
-    const openspecDir = await findOpenspecDir();
+    // Find or create openspec directory
+    let openspecDir = await findOpenspecDir();
     if (!openspecDir) {
-      console.error(chalk.red('No openspec/changes directory found'));
-      process.exit(1);
+      // Create openspec/changes directory in repo root
+      try {
+        const repoRoot = await getRepoRoot();
+        openspecDir = path.join(repoRoot, OPENSPEC_DIR);
+        fs.mkdirSync(openspecDir, { recursive: true });
+        console.log(chalk.gray(`Created ${OPENSPEC_DIR}/`));
+      } catch {
+        console.error(chalk.red('Not in a git repository and no openspec/changes directory found'));
+        process.exit(1);
+      }
     }
 
     // Resolve ticket ID
